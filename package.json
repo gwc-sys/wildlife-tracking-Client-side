@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@types/node": "^22.13.17",
+    "eventemitter3": "^5.0.1",
     "firebase": "^11.6.0",
     "lucide-react": "^0.344.0",
     "react": "^18.3.1",
@@ -19,7 +21,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",
-    "@types/react": "^18.3.5",
+    "@types/react": "^18.3.20",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.18",

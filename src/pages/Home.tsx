@@ -3,13 +3,11 @@ import 'swiper/css';
 import 'swiper/css/navigation';
 import 'swiper/css/pagination';
 import { Navigation, Pagination, Autoplay } from 'swiper/modules'; // Import Autoplay module
-
 // Import your images
 import image1 from '../assets/pexels-muchowmedia-2955703.jpg';
 import image2 from '../assets/pexels-pixabay-45853.jpg';
 import image3 from '../assets/pexels-pixabay-47547.jpg';
 import image4 from '../assets/pexels-valeriya-1961772.jpg';
-
 export default function Home() {
   return (
     <div className="bg-white">
@@ -37,7 +35,6 @@ export default function Home() {
               </div>
             </div>
           </SwiperSlide>
-
           {/* Slide 2 */}
           <SwiperSlide>
             <div className="relative w-full h-[500px]">
@@ -52,7 +49,6 @@ export default function Home() {
               </div>
             </div>
           </SwiperSlide>
-
           {/* Slide 3 */}
           <SwiperSlide>
             <div className="relative w-full h-[500px]">
@@ -67,7 +63,6 @@ export default function Home() {
               </div>
             </div>
           </SwiperSlide>
-
           {/* Slide 4 */}
           <SwiperSlide>
             <div className="relative w-full h-[500px]">
@@ -84,7 +79,6 @@ export default function Home() {
           </SwiperSlide>
         </Swiper>
       </div>
-
       {/* Welcome Section */}
       <div className="relative isolate px-6 pt-14 lg:px-8">
         <div className="mx-auto max-w-2xl py-32 sm:py-48 lg:py-56">

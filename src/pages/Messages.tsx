@@ -1,46 +1,198 @@
 import { useEffect, useState } from 'react';
-import { database } from './firebaseDatabaseConfig'; // Correctly typed import
-import { ref, onValue } from 'firebase/database'; // Import Firebase Realtime Database functions
+import { database } from './firebaseDatabaseConfig';
+import { ref, onValue, off, query, limitToLast, orderByKey } from 'firebase/database';
 
-export default function Messages() {
-  const [motionStatus, setMotionStatus] = useState<string | null>(null);
+interface MotionEvent {
+  status: string;
+  timestamp: number;
+}
+
+export default function MotionMonitor() {
+  const [currentStatus, setCurrentStatus] = useState<MotionEvent | null>(null);
+  const [history, setHistory] = useState<{id: string, data: MotionEvent}[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  // Format status for display
+  const formatStatus = (status: string) => {
+    return status === "Motion Detected" ? "🚨 Motion Detected" : "✅ No Motion";
+  };
+
+  // Format timestamp for display
+  const formatTime = (timestamp: number) => {
+    return new Date(timestamp).toLocaleString();
+  };
 
   useEffect(() => {
-    // Reference to the "motion_status" node in the database
-    const motionStatusRef = ref(database, 'motion_status');
+    const motionRef = ref(database, 'motion_status');
 
-    // Listen for real-time updates
-    const unsubscribe = onValue(motionStatusRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        setMotionStatus(data.status); // Assuming the data structure has a "status" field
+    // 1. Load Historical Data (last 10 events)
+    const historyQuery = query(
+      motionRef,
+      orderByKey(),
+      limitToLast(10)
+    );
+
+    const historyUnsubscribe = onValue(
+      historyQuery,
+      (snapshot) => {
+        try {
+          const historicalData: {id: string, data: MotionEvent}[] = [];
+          
+          snapshot.forEach((childSnapshot) => {
+            const eventData = childSnapshot.val();
+            if (eventData && typeof eventData === 'object') {
+              historicalData.push({
+                id: childSnapshot.key || `fallback-${Date.now()}`,
+                data: {
+                  status: eventData.status || "Status Unknown",
+                  timestamp: eventData.timestamp || Date.now()
+                }
+              });
+            }
+          });
+
+          setHistory(historicalData.reverse());
+          setError(null);
+        } catch (error) {
+          setError(`Failed to load history: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      },
+      (error) => {
+        setError(`History listener error: ${error.message}`);
       }
-    });
+    );
 
-    // Cleanup the listener on component unmount
-    return () => unsubscribe();
+    // 2. Set up real-time listener
+    const realtimeUnsubscribe = onValue(
+      motionRef,
+      (snapshot) => {
+        try {
+          let latestEvent: {id: string, data: MotionEvent} | null = null;
+          
+          snapshot.forEach((childSnapshot) => {
+            const eventData = childSnapshot.val();
+            if (eventData && typeof eventData === 'object') {
+              latestEvent = {
+                id: childSnapshot.key || `realtime-${Date.now()}`,
+                data: {
+                  status: eventData.status || "Status Unknown",
+                  timestamp: eventData.timestamp || Date.now()
+                }
+              };
+            }
+          });
+
+          if (latestEvent) {
+            setCurrentStatus(latestEvent.data);
+            
+            // Update history if this is a new event
+            setHistory(prev => {
+              const exists = prev.some(item => item.id === latestEvent?.id);
+              return exists ? prev : [latestEvent!, ...prev.slice(0, 9)];
+            });
+            
+            setError(null);
+          }
+        } catch (error) {
+          setError(`Failed to process update: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      },
+      (error) => {
+        setError(`Real-time listener error: ${error.message}`);
+      }
+    );
+
+    return () => {
+      off(historyQuery);
+      off(motionRef);
+    };
   }, []);
 
   return (
-    <div className="bg-white py-24 sm:py-32">
-      <div className="mx-auto max-w-7xl px-6 lg:px-8">
-        <div className="mx-auto max-w-2xl lg:text-center">
-          <h2 className="text-base font-semibold leading-7 text-indigo-600">Messages</h2>
-          <p className="mt-2 text-3xl font-bold tracking-tight text-gray-900 sm:text-4xl">
-            Stay Connected
-          </p>
-          <p className="mt-6 text-lg leading-8 text-gray-600">
-            Keep up with the latest updates and communications from our team.
+    <div className="bg-white py-12 sm:py-16">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+        {/* Header */}
+        <div className="text-center">
+          <h1 className="text-3xl font-bold tracking-tight text-gray-900 sm:text-4xl">
+            Motion Detection System
+          </h1>
+          <p className="mt-3 max-w-2xl mx-auto text-xl text-gray-500 sm:mt-4">
+            Real-time security monitoring
           </p>
         </div>
 
-        {/* Display Motion Status */}
-        <div className="mt-10 text-center">
-          <h3 className="text-2xl font-bold text-gray-900">Motion Status</h3>
-          <p className="mt-4 text-lg text-gray-600">
-            {motionStatus ? motionStatus : 'Loading...'}
-          </p>
+        {/* Current Status */}
+        <div className="mt-10 bg-gray-50 p-6 rounded-lg shadow">
+          <h2 className="text-xl font-semibold text-gray-900">Current Status</h2>
+          <div className="mt-4">
+            {currentStatus ? (
+              <div className={`p-4 rounded-md ${
+                currentStatus.status.includes("Detected") 
+                  ? "bg-red-50 border border-red-200" 
+                  : "bg-green-50 border border-green-200"
+              }`}>
+                <p className={`text-lg font-medium ${
+                  currentStatus.status.includes("Detected")
+                    ? "text-red-700" 
+                    : "text-green-700"
+                }`}>
+                  {formatStatus(currentStatus.status)}
+                </p>
+                <p className="mt-1 text-sm text-gray-500">
+                  {formatTime(currentStatus.timestamp)}
+                </p>
+              </div>
+            ) : (
+              <p className="text-gray-500">Loading current status...</p>
+            )}
+          </div>
         </div>
+
+        {/* Event History */}
+        <div className="mt-10">
+          <h2 className="text-xl font-semibold text-gray-900">Event History</h2>
+          <ul className="mt-4 space-y-3">
+            {history.length > 0 ? (
+              history.map((event) => (
+                <li 
+                  key={event.id}
+                  className={`p-4 rounded-md border ${
+                    event.data.status.includes("Detected")
+                      ? "bg-red-50 border-red-100"
+                      : "bg-green-50 border-green-100"
+                  }`}
+                >
+                  <div className="flex justify-between items-center">
+                    <span className={`font-medium ${
+                      event.data.status.includes("Detected")
+                        ? "text-red-700"
+                        : "text-green-700"
+                    }`}>
+                      {formatStatus(event.data.status)}
+                    </span>
+                    <span className="text-sm text-gray-500">
+                      {formatTime(event.data.timestamp)}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-xs text-gray-400">
+                    Event ID: {event.id.substring(0, 8)}...
+                  </div>
+                </li>
+              ))
+            ) : (
+              <li className="text-gray-500 py-4 text-center">
+                {error ? "Error loading events" : "No motion events recorded yet"}
+              </li>
+            )}
+          </ul>
+        </div>
+
+        {/* Error Display */}
+        {error && (
+          <div className="mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+            <p className="text-yellow-700">{error}</p>
+          </div>
+        )}
       </div>
     </div>
   );
