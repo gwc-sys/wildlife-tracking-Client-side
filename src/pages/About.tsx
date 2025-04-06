@@ -29,7 +29,12 @@ export default function LocationTrackerWithMap() {
   const [isTracking, setIsTracking] = useState(false);
   const [trackingHistory, setTrackingHistory] = useState<{id: string, path: {lat: number, lng: number}[], startTime: number, endTime: number}[]>([]);
 
-  // Debugging logs
+  // Load Google Maps with environment variable
+  const { isLoaded, loadError } = useLoadScript({
+    googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_API_KEY
+  });
+
+  // Debugging logs (removed process.env reference)
   console.log('Current state:', {
     currentLocation,
     history: history.length,
@@ -37,12 +42,6 @@ export default function LocationTrackerWithMap() {
     trackingHistory: trackingHistory.length,
     error
   });
-
-  const { isLoaded, loadError } = useLoadScript({
-    googleMapsApiKey: 'AIzaSyD1AU417WvKaz4_LT5B2hrWPuCypMVjio0'
-    
-  });
-  console.log('Google Maps API Key:', process.env.REACT_APP_GOOGLE_MAPS_API_KEY);
 
   const formatTime = (timestamp: number) => {
     return new Date(timestamp).toLocaleString();

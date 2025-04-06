@@ -17,7 +17,7 @@ export default function Footer() {
             <ul className="space-y-2">
               <li>
                 <Link to="/about" className="text-gray-400 hover:text-white text-sm">
-                  About
+                Live Tracking Map
                 </Link>
               </li>
               <li>
