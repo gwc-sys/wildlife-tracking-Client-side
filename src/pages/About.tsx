@@ -1,13 +1,20 @@
 import { useEffect, useState, useCallback } from 'react';
 import { database } from './firebaseDatabaseConfig';
-import { ref, onValue, off, query, limitToLast, orderByKey } from 'firebase/database';
+import { ref, onValue, off, query, limitToLast, orderByChild } from 'firebase/database';
 import { GoogleMap, Marker, Polyline, useLoadScript } from '@react-google-maps/api';
 
 interface LocationData {
   accuracy: number;
   lat: number;
   lng: number;
-  timestamp?: number;
+  source?: string;
+  timestamp: number;
+}
+
+interface AlertData {
+  status: string;
+  timestamp: number;
+  source?: string;
 }
 
 const mapContainerStyle = {
@@ -16,35 +23,27 @@ const mapContainerStyle = {
 };
 
 const defaultCenter = {
-  lat: 0,
-  lng: 0
+  lat: 18.67786,
+  lng: 73.84219
 };
 
 export default function LocationTrackerWithMap() {
   const [currentLocation, setCurrentLocation] = useState<{id: string, data: LocationData} | null>(null);
   const [history, setHistory] = useState<{id: string, data: LocationData}[]>([]);
+  const [alerts, setAlerts] = useState<{id: string, data: AlertData}[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [map, setMap] = useState<google.maps.Map | null>(null);
   const [travelPath, setTravelPath] = useState<{lat: number, lng: number}[]>([]);
   const [isTracking, setIsTracking] = useState(false);
   const [trackingHistory, setTrackingHistory] = useState<{id: string, path: {lat: number, lng: number}[], startTime: number, endTime: number}[]>([]);
 
-  // Load Google Maps with environment variable
   const { isLoaded, loadError } = useLoadScript({
     googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_API_KEY
   });
 
-  // Debugging logs (removed process.env reference)
-  console.log('Current state:', {
-    currentLocation,
-    history: history.length,
-    travelPath: travelPath.length,
-    trackingHistory: trackingHistory.length,
-    error
-  });
-
   const formatTime = (timestamp: number) => {
-    return new Date(timestamp).toLocaleString();
+    const adjustedTimestamp = timestamp > 1e12 ? timestamp / 1000 : timestamp;
+    return new Date(adjustedTimestamp).toLocaleString();
   };
 
   const formatCoordinates = (lat: number, lng: number) => {
@@ -58,7 +57,7 @@ export default function LocationTrackerWithMap() {
         {
           id: `track-${Date.now()}`,
           path: [...travelPath],
-          startTime: travelPath[0] ? Number(Object.keys(travelPath[0])[0]) : Date.now(),
+          startTime: travelPath[0] ? travelPath[0].lat : Date.now(),
           endTime: Date.now()
         }
       ]);
@@ -74,7 +73,7 @@ export default function LocationTrackerWithMap() {
         {
           id: `track-${Date.now()}`,
           path: [...travelPath],
-          startTime: travelPath[0] ? Number(Object.keys(travelPath[0])[0]) : Date.now(),
+          startTime: travelPath[0] ? travelPath[0].lat : Date.now(),
           endTime: Date.now()
         }
       ]);
@@ -99,94 +98,125 @@ export default function LocationTrackerWithMap() {
 
   useEffect(() => {
     console.log('Initializing Firebase listeners');
-    const locationRef = ref(database, 'device_001/locations');
+    
+    // Check if database is initialized
+    if (!database) {
+      setError('Firebase database is not initialized');
+      return;
+    }
 
-    const historyQuery = query(
-      locationRef,
-      orderByKey(),
+    // Locations reference - using a more flexible path
+    const locationsRef = ref(database, 'locations/device_001'); // or 'devices/device_001/locations'
+    const locationsQuery = query(
+      locationsRef,
+      orderByChild('timestamp'),
       limitToLast(50)
     );
 
-    const historyUnsubscribe = onValue(
-      historyQuery,
+    // Alerts reference
+    const alertsRef = ref(database, 'alerts/device_001'); // or 'devices/device_001/alerts'
+    const alertsQuery = query(
+      alertsRef,
+      orderByChild('timestamp'),
+      limitToLast(10)
+    );
+
+    const locationsUnsubscribe = onValue(
+      locationsQuery,
       (snapshot) => {
         try {
-          console.log('Received history data', snapshot.val());
-          const historicalData: {id: string, data: LocationData}[] = [];
+          if (!snapshot.exists()) {
+            console.log('No location data available');
+            setHistory([]);
+            return;
+          }
+
+          const locationsData: {id: string, data: LocationData}[] = [];
           
           snapshot.forEach((childSnapshot) => {
             const locationData = childSnapshot.val();
             if (locationData && typeof locationData === 'object') {
-              historicalData.push({
-                id: childSnapshot.key || `fallback-${Date.now()}`,
+              locationsData.push({
+                id: childSnapshot.key || `loc-${Date.now()}`,
                 data: {
                   accuracy: locationData.accuracy || 0,
                   lat: locationData.lat || 0,
                   lng: locationData.lng || 0,
-                  timestamp: Number(childSnapshot.key) || Date.now()
+                  source: locationData.source || 'Unknown',
+                  timestamp: locationData.timestamp || Date.now()
                 }
               });
             }
           });
 
-          setHistory(historicalData.reverse());
+          // Sort by timestamp (newest first)
+          locationsData.sort((a, b) => b.data.timestamp - a.data.timestamp);
+          
+          setHistory(locationsData);
+          
+          // Set current location to the most recent one
+          if (locationsData.length > 0) {
+            setCurrentLocation(locationsData[0]);
+          }
+          
           setError(null);
         } catch (error) {
-          console.error('History error:', error);
-          setError(`Failed to load history: ${error instanceof Error ? error.message : 'Unknown error'}`);
+          console.error('Locations error:', error);
+          setError(`Failed to load locations: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
       },
       (error) => {
-        console.error('History listener error:', error);
-        setError(`History error: ${error.message}`);
+        console.error('Locations listener error:', error);
+        setError(`Locations error: ${error.message}`);
       }
     );
 
-    const realtimeUnsubscribe = onValue(
-      locationRef,
+    const alertsUnsubscribe = onValue(
+      alertsQuery,
       (snapshot) => {
         try {
-          console.log('Received realtime update', snapshot.val());
-          let latestLocation: {id: string, data: LocationData} | null = null;
+          if (!snapshot.exists()) {
+            console.log('No alert data available');
+            setAlerts([]);
+            return;
+          }
+
+          const alertsData: {id: string, data: AlertData}[] = [];
           
           snapshot.forEach((childSnapshot) => {
-            const locationData = childSnapshot.val();
-            if (locationData && typeof locationData === 'object') {
-              latestLocation = {
-                id: childSnapshot.key || `realtime-${Date.now()}`,
+            const alertData = childSnapshot.val();
+            if (alertData && typeof alertData === 'object') {
+              alertsData.push({
+                id: childSnapshot.key || `alert-${Date.now()}`,
                 data: {
-                  accuracy: locationData.accuracy || 0,
-                  lat: locationData.lat || 0,
-                  lng: locationData.lng || 0,
-                  timestamp: Number(childSnapshot.key) || Date.now()
+                  status: alertData.status || 'Unknown',
+                  source: alertData.source || 'Unknown',
+                  timestamp: alertData.timestamp || Date.now()
                 }
-              };
+              });
             }
           });
 
-          if (latestLocation) {
-            setCurrentLocation(latestLocation);
-            setHistory(prev => {
-              const exists = prev.some(item => item.id === latestLocation?.id);
-              return exists ? prev : [latestLocation!, ...prev.slice(0, 49)];
-            });
-            setError(null);
-          }
+          // Sort by timestamp (newest first)
+          alertsData.sort((a, b) => b.data.timestamp - a.data.timestamp);
+          
+          setAlerts(alertsData);
+          setError(null);
         } catch (error) {
-          console.error('Realtime error:', error);
-          setError(`Failed to process update: ${error instanceof Error ? error.message : 'Unknown error'}`);
+          console.error('Alerts error:', error);
+          setError(`Failed to load alerts: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
       },
       (error) => {
-        console.error('Realtime listener error:', error);
-        setError(`Realtime error: ${error.message}`);
+        console.error('Alerts listener error:', error);
+        setError(`Alerts error: ${error.message}`);
       }
     );
 
     return () => {
       console.log('Cleaning up Firebase listeners');
-      off(historyQuery);
-      off(locationRef);
+      off(locationsRef);
+      off(alertsRef);
     };
   }, []);
 
@@ -207,7 +237,7 @@ export default function LocationTrackerWithMap() {
       map.fitBounds(bounds);
     } else {
       map.setCenter(defaultCenter);
-      map.setZoom(2);
+      map.setZoom(12);
     }
   }, [currentLocation, history]);
 
@@ -277,7 +307,7 @@ export default function LocationTrackerWithMap() {
                 lat: currentLocation.data.lat, 
                 lng: currentLocation.data.lng 
               } : defaultCenter}
-              zoom={currentLocation ? 15 : 2}
+              zoom={currentLocation ? 15 : 12}
               onLoad={onLoad}
               options={{
                 streetViewControl: false,
@@ -354,12 +384,18 @@ export default function LocationTrackerWithMap() {
                     ±{currentLocation.data.accuracy} meters
                   </p>
                 </div>
-              </div>
-              <div className="mt-4">
-                <p className="text-sm text-gray-500">Last Updated</p>
-                <p className="text-gray-700">
-                  {formatTime(currentLocation.data.timestamp || Number(currentLocation.id))}
-                </p>
+                <div>
+                  <p className="text-sm text-gray-500">Source</p>
+                  <p className="text-lg text-blue-700">
+                    {currentLocation.data.source || 'Unknown'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">Last Updated</p>
+                  <p className="text-lg text-blue-700">
+                    {formatTime(currentLocation.data.timestamp)}
+                  </p>
+                </div>
               </div>
               <div className="mt-4">
                 <a
@@ -381,6 +417,30 @@ export default function LocationTrackerWithMap() {
             </div>
           )}
         </div>
+
+        {/* Alerts Section */}
+        {alerts.length > 0 && (
+          <div className="bg-gray-50 p-6 rounded-lg shadow-md mb-8">
+            <h2 className="text-xl font-semibold text-gray-800 mb-4">Recent Alerts</h2>
+            <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+              <ul className="divide-y divide-gray-200 max-h-96 overflow-y-auto">
+                {alerts.map((alert) => (
+                  <li key={alert.id} className="p-4 hover:bg-gray-50">
+                    <div className="flex justify-between items-center">
+                      <div>
+                        <p className="font-medium text-red-600">{alert.data.status}</p>
+                        <p className="text-sm text-gray-500">{formatTime(alert.data.timestamp)}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-500">Source: {alert.data.source || 'Unknown'}</p>
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
 
         {/* Tracking History Section */}
         {trackingHistory.length > 0 && (
@@ -405,11 +465,11 @@ export default function LocationTrackerWithMap() {
                   <div className="grid grid-cols-2 gap-2 mt-2">
                     <div>
                       <p className="text-xs text-gray-500">Start</p>
-                      <p className="text-xs">{new Date(track.startTime).toLocaleTimeString()}</p>
+                      <p className="text-xs">{formatTime(track.startTime)}</p>
                     </div>
                     <div>
                       <p className="text-xs text-gray-500">End</p>
-                      <p className="text-xs">{new Date(track.endTime).toLocaleTimeString()}</p>
+                      <p className="text-xs">{formatTime(track.endTime)}</p>
                     </div>
                   </div>
                   <button
@@ -454,7 +514,7 @@ export default function LocationTrackerWithMap() {
                       <div>
                         <p className="text-xs text-gray-500">Time</p>
                         <p className="text-xs">
-                          {formatTime(location.data.timestamp || Number(location.id))}
+                          {formatTime(location.data.timestamp)}
                         </p>
                       </div>
                     </div>
