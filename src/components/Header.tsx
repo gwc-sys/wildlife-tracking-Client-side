@@ -6,8 +6,8 @@ const navigation = [
   { name: 'About', href: '/about' },
   { name: 'Get Involved', href: '/get-involved' },
   { name: 'Messages', href: '/messages' },
-  { name: 'Materials', href: '/materials' },
-  { name: 'Press', href: '/press' },
+  { name: 'Live Tracking Map', href: '/materials' },
+  { name: 'Live Tracking Map', href: '/press' },
 ];
 
 export default function Header() {
