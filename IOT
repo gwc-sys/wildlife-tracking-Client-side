@@ -1,0 +1,459 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <ArduinoJson.h>
+#include <Firebase_ESP_Client.h>
+
+// ===== CONFIGURATION ===== (Update these with your details)
+// WiFi
+const char* WIFI_SSID = "IPhone-SE";
+const char* WIFI_PASS = "11222255678";
+
+// Firebase
+const char* FIREBASE_URL = "https://te-project-d9e53-default-rtdb.firebaseio.com/";
+const char* FIREBASE_SECRET = "NOvZ58OPWb8gan8I438hzsS0Dr96JrseGtqTqxOj";
+const char* DEVICE_ID = "-OMxlruhcnBp92AAkV05";
+
+// Twilio (SMS)
+struct TwilioConfig {
+    const char* SID = "AC715623333962d6046aac01be89657de7";
+    const char* TOKEN = "bb1554d7dcd562c7374029a5371ca6d4";
+    const char* FROM = "+14123575093";
+    const char* TO = "+919021329710";
+} TWILIO;
+
+// Hardware Pins
+struct PinConfig {
+    int PIR = 13;         // GPIO13 for motion sensor
+    int LED_RED = 12;     // GPIO12 for red LED
+    int LED_GREEN = 14;   // GPIO14 for green LED
+    int GPS_TX = 17;      // GPIO17 (UART2 TX)
+    int GPS_RX = 16;      // GPIO16 (UART2 RX)
+} PINS;
+
+// Timing Settings
+const int GPS_UPDATE_INTERVAL = 30;  // Update location every 30 seconds
+const int MOTION_COOLDOWN = 30;      // Seconds between motion alerts
+const int WIFI_RETRY_INTERVAL = 5;   // Retry WiFi every 5 seconds if disconnected
+const int GPS_WARMUP_TIME = 60;      // Seconds to wait for GPS to initialize
+const int MAX_GPS_RETRIES = 3;       // Max attempts to get GPS fix
+
+// ===== GLOBAL OBJECTS =====
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(2);  // UART2 for GPS
+WiFiClient client;
+HTTPClient http;
+
+// ===== LED FUNCTIONS =====
+void test_leds() {
+    digitalWrite(PINS.LED_RED, HIGH);
+    delay(500);
+    digitalWrite(PINS.LED_RED, LOW);
+    digitalWrite(PINS.LED_GREEN, HIGH);
+    delay(500);
+    digitalWrite(PINS.LED_GREEN, LOW);
+}
+
+void set_led_status(bool connected) {
+    digitalWrite(PINS.LED_GREEN, connected ? HIGH : LOW);
+    digitalWrite(PINS.LED_RED, connected ? LOW : HIGH);
+}
+
+void gps_status_led() {
+    static unsigned long last_toggle = 0;
+    const unsigned long interval = 500; // ms
+    
+    if (gps.location.isValid()) {
+        if (millis() - last_toggle >= interval) {
+            digitalWrite(PINS.LED_GREEN, !digitalRead(PINS.LED_GREEN));
+            last_toggle = millis();
+        }
+    } else {
+        digitalWrite(PINS.LED_GREEN, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
+    }
+}
+
+// ===== GPS FUNCTIONS =====
+bool process_gps() {
+    while (SerialGPS.available() > 0) {
+        if (gps.encode(SerialGPS.read())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool wait_for_gps_fix(unsigned long timeout) {
+    unsigned long start = millis();
+    while (millis() - start < timeout) {
+        process_gps();
+        if (gps.location.isValid() && gps.location.age() < 2000) { // Fix less than 2 seconds old
+            return true;
+        }
+        delay(100);
+    }
+    return false;
+}
+
+String get_gps_location_json() {
+    DynamicJsonDocument doc(256);
+    
+    if (gps.location.isValid()) {
+        doc["lat"] = gps.location.lat();
+        doc["lng"] = gps.location.lng();
+        doc["accuracy"] = gps.hdop.value() / 100.0;
+        doc["timestamp"] = millis();
+    } else {
+        doc["lat"] = 0;
+        doc["lng"] = 0;
+        doc["accuracy"] = 0;
+        doc["timestamp"] = millis();
+    }
+
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    return jsonStr;
+}
+
+bool update_gps_location() {
+    if (!gps.location.isValid()) {
+        Serial.println("No valid GPS data available");
+        return false;
+    }
+
+    String locationJson = get_gps_location_json();
+    bool success = false;
+
+    if (WiFi.status() == WL_CONNECTED) {
+        // Update last_known location
+        String url = String(FIREBASE_URL) + "devices/" + DEVICE_ID + "/location/last_known.json?auth=" + FIREBASE_SECRET;
+        
+        for (int attempt = 0; attempt < 3; attempt++) {
+            http.begin(client, url);
+            http.addHeader("Content-Type", "application/json");
+            int httpCode = http.PUT(locationJson);
+            
+            if (httpCode == 200) {
+                Serial.println("Location updated successfully");
+                success = true;
+                break;
+            } else {
+                Serial.print("Location update failed, attempt ");
+                Serial.print(attempt + 1);
+                Serial.print(" of 3. HTTP Code: ");
+                Serial.println(httpCode);
+                delay(1000);
+            }
+            http.end();
+        }
+
+        if (success) {
+            // Add to location history
+            url = String(FIREBASE_URL) + "devices/" + DEVICE_ID + "/location/history.json?auth=" + FIREBASE_SECRET;
+            http.begin(client, url);
+            http.addHeader("Content-Type", "application/json");
+            int httpCode = http.POST(locationJson);
+            
+            if (httpCode == 200) {
+                Serial.println("Location history updated");
+            } else {
+                Serial.print("Failed to update location history. HTTP Code: ");
+                Serial.println(httpCode);
+            }
+            http.end();
+        }
+    } else {
+        Serial.println("WiFi not connected - can't update location");
+    }
+    
+    return success;
+}
+
+// ===== WIFI CONNECTION =====
+bool connect_wifi() {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
+    
+    Serial.print("Connecting to WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) { // 20 second timeout
+        digitalWrite(PINS.LED_RED, !digitalRead(PINS.LED_RED)); // Blink while connecting
+        Serial.print(".");
+        delay(500);
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+        set_led_status(true);
+        return true;
+    }
+    
+    Serial.println("\nConnection failed");
+    set_led_status(false);
+    return false;
+}
+
+// ===== MOTION DETECTION =====
+bool check_motion() {
+    static unsigned long last_trigger = 0;
+    const unsigned long debounce_time = 2000; // 2 seconds debounce
+    
+    if (digitalRead(PINS.PIR) == HIGH && millis() - last_trigger > debounce_time) {
+        last_trigger = millis();
+        Serial.println("Motion detected!");
+        return true;
+    }
+    return false;
+}
+
+String get_motion_status_json(bool status) {
+    DynamicJsonDocument doc(128);
+    doc["status"] = status ? "Motion Detected" : "No Motion";
+    doc["timestamp"] = millis();
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    return jsonStr;
+}
+
+bool update_motion_status(bool status) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected - can't update motion status");
+        return false;
+    }
+
+    String statusJson = get_motion_status_json(status);
+    bool success = false;
+    
+    // Update last status
+    String url = String(FIREBASE_URL) + "devices/" + DEVICE_ID + "/motion_status/last.json?auth=" + FIREBASE_SECRET;
+    
+    for (int attempt = 0; attempt < 3; attempt++) {
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+        int httpCode = http.PUT(statusJson);
+        
+        if (httpCode == 200) {
+            success = true;
+            break;
+        } else {
+            Serial.print("Motion status update failed, attempt ");
+            Serial.print(attempt + 1);
+            Serial.print(" of 3. HTTP Code: ");
+            Serial.println(httpCode);
+            delay(1000);
+        }
+        http.end();
+    }
+
+    if (success) {
+        // Add to history
+        url = String(FIREBASE_URL) + "devices/" + DEVICE_ID + "/motion_status/history.json?auth=" + FIREBASE_SECRET;
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+        int httpCode = http.POST(statusJson);
+        
+        if (httpCode != 200) {
+            Serial.print("Failed to update motion history. HTTP Code: ");
+            Serial.println(httpCode);
+        }
+        http.end();
+    }
+    
+    return success;
+}
+
+// ===== ALERT FUNCTIONS (UPDATED) =====
+String get_alert_json(const char* source) {
+    DynamicJsonDocument doc(128);
+    doc["source"] = source;  // "GPS" or "Fallback"
+    doc["status"] = "Motion Alert";
+    doc["timestamp"] = millis();
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    return jsonStr;
+}
+
+void visual_alert() {
+    for (int i = 0; i < 5; i++) {
+        digitalWrite(PINS.LED_RED, HIGH);
+        digitalWrite(PINS.LED_GREEN, LOW);
+        delay(200);
+        digitalWrite(PINS.LED_RED, LOW);
+        digitalWrite(PINS.LED_GREEN, HIGH);
+        delay(200);
+    }
+    digitalWrite(PINS.LED_GREEN, LOW);
+}
+
+String generate_map_url() {
+    if (gps.location.isValid()) {
+        return "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+    }
+    return "Location unavailable";
+}
+
+bool send_sms_alert() {
+    String mapUrl = generate_map_url();
+    String smsBody = "🚨 ALERT: Motion Detected!\n";
+    smsBody += "📍 Location: " + mapUrl + "\n";
+    smsBody += "🕒 Time: " + String(millis() / 1000) + " seconds since startup";
+    
+    String url = "https://api.twilio.com/2010-04-01/Accounts/" + String(TWILIO.SID) + "/Messages.json";
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.setAuthorization(TWILIO.SID, TWILIO.TOKEN);
+    
+    String postData = "To=" + String(TWILIO.TO) + 
+                     "&From=" + String(TWILIO.FROM) + 
+                     "&Body=" + smsBody;
+    
+    int httpCode = http.POST(postData);
+    bool success = (httpCode == 200 || httpCode == 201);
+    
+    if (success) {
+        Serial.println("SMS alert sent successfully!");
+    } else {
+        Serial.print("Failed to send SMS. HTTP Code: ");
+        Serial.println(httpCode);
+        String response = http.getString();
+        Serial.println("Response: " + response);
+    }
+    
+    http.end();
+    return success;
+}
+
+bool send_alert() {
+    Serial.println("Preparing alert...");
+    visual_alert();
+    
+    bool smsSent = false;
+    bool firebaseUpdated = false;
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        // Send SMS
+        smsSent = send_sms_alert();
+        
+        // Update Firebase - use GPS if available, otherwise fallback
+        const char* alertSource = gps.location.isValid() ? "GPS" : "Fallback";
+        String alertJson = get_alert_json(alertSource);
+        String url = String(FIREBASE_URL) + "devices/" + DEVICE_ID + "/alerts.json?auth=" + FIREBASE_SECRET;
+        
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+        int httpCode = http.POST(alertJson);
+        
+        if (httpCode == 200) {
+            Serial.println("Alert logged to Firebase");
+            firebaseUpdated = true;
+        } else {
+            Serial.print("Failed to log alert to Firebase. HTTP Code: ");
+            Serial.println(httpCode);
+        }
+        http.end();
+    } else {
+        Serial.println("WiFi not connected - can't send alert");
+    }
+    
+    return smsSent && firebaseUpdated;
+}
+
+// ===== MAIN SETUP AND LOOP =====
+void setup() {
+    Serial.begin(115200);
+    SerialGPS.begin(9600, SERIAL_8N1, PINS.GPS_RX, PINS.GPS_TX);
+    
+    // Initialize pins
+    pinMode(PINS.PIR, INPUT);
+    pinMode(PINS.LED_RED, OUTPUT);
+    pinMode(PINS.LED_GREEN, OUTPUT);
+    
+    test_leds();
+    
+    // Initialize WiFi
+    if (!connect_wifi()) {
+        Serial.println("Failed to connect to WiFi. Retrying in main loop...");
+    }
+    
+    // Wait for GPS to initialize
+    Serial.print("Waiting for GPS fix (max ");
+    Serial.print(GPS_WARMUP_TIME);
+    Serial.println(" seconds)...");
+    
+    if (wait_for_gps_fix(GPS_WARMUP_TIME * 1000)) {
+        Serial.println("GPS fix acquired!");
+        Serial.print("Location: ");
+        Serial.print(gps.location.lat(), 6);
+        Serial.print(", ");
+        Serial.println(gps.location.lng(), 6);
+    } else {
+        Serial.println("Could not get GPS fix. Continuing without location...");
+    }
+    
+    // Initial status updates
+    update_motion_status(false);
+    if (gps.location.isValid()) {
+        update_gps_location();
+    }
+    
+    Serial.println("System ready. Monitoring for motion...");
+}
+
+void loop() {
+    static unsigned long last_wifi_check = 0;
+    static unsigned long last_gps_update = 0;
+    static unsigned long last_motion_alert = 0;
+    static bool last_motion_state = false;
+    
+    unsigned long current_time = millis();
+    
+    // Process GPS data continuously
+    process_gps();
+    
+    // WiFi maintenance
+    if (current_time - last_wifi_check >= WIFI_RETRY_INTERVAL * 1000 || WiFi.status() != WL_CONNECTED) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected. Attempting to reconnect...");
+            connect_wifi();
+        }
+        last_wifi_check = current_time;
+    }
+    
+    // GPS updates
+    if (current_time - last_gps_update >= GPS_UPDATE_INTERVAL * 1000) {
+        if (gps.location.isValid()) {
+            if (update_gps_location()) {
+                last_gps_update = current_time;
+            }
+        } else {
+            Serial.println("Skipping GPS update - no valid fix");
+            last_gps_update = current_time; // Don't spam attempts
+        }
+    }
+    
+    // Motion detection
+    bool current_motion = check_motion();
+    
+    if (current_motion != last_motion_state) {
+        if (update_motion_status(current_motion)) {
+            last_motion_state = current_motion;
+            
+            if (current_motion && (current_time - last_motion_alert >= MOTION_COOLDOWN * 1000)) {
+                send_alert();
+                last_motion_alert = current_time;
+            }
+        }
+    }
+    
+    // Status LED updates
+    gps_status_led();
+    
+    // Small delay to prevent watchdog timer issues
+    delay(100);
+}
